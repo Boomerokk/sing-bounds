@@ -1,0 +1,1 @@
+vless://11111111-1111-1111-1111-111111111111@77.88.8.8:443?encryption=none&security=reality&pbk=PUBLIC_KEY_1&fp=chrome&sid=0123456789abcdef&sni=www.microsoft.com&type=tcp&flow=xtls-rprx-vision#%D0%94%D0%BB%D1%8F%20%D0%A1%D0%B5%D1%80%D0%B3%D0%B5%D1%8F

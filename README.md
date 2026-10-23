@@ -7,7 +7,7 @@
 Интернет «как дома» из любой точки мира — без подписок и платных сервисов.
 Сервер — ваш собственный роутер.
 
-**[English README](README.en.md)**
+**[English README](README.en.md)** · Лицензия: [MIT](LICENSE)
 
 </div>
 
@@ -234,6 +234,20 @@ make package/luci-app-singbounds/compile V=s
 
 Установщик-скрипт и пакет эквивалентны; пакет — для тех, кто предпочитает
 штатный opkg/apk-менеджмент.
+
+</details>
+
+<details>
+<summary><b>🧪 Тесты (локальные, без роутера)</b></summary>
+
+В `tests/` лежит локальный набор тестов ядра (генерация конфига sing-box,
+ссылки vless://, загрузка состояния UCI, firewall, dry-run init-скрипта) с
+golden-файлами. Требуется `ucode` (Linux/WSL: `apk add ucode` или из репозитория
+OpenWrt):
+
+```sh
+sh tests/run-local.sh
+```
 
 </details>
 

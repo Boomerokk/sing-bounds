@@ -1,0 +1,17 @@
+{
+	"luci-app-singbounds": {
+		"description": "Grant access to LuCI singbounds configuration",
+		"read": {
+			"uci": [ "singbounds", "firewall" ],
+			"ubus": {
+				"singbounds": [ "status", "list", "add_inbound", "del_inbound", "add_client", "del_client", "get_links", "uninstall", "toggle_inbound", "toggle_client", "edit_inbound", "check_wan", "restart", "tsc_status", "tsc_install_info", "tsc_install", "tsc_server", "tsc_login", "tsc_logout", "tsc_remove" ]
+			},
+			"file": {
+				"/www/singbounds/": [ "read" ]
+			}
+		},
+		"write": {
+			"uci": [ "singbounds", "firewall" ]
+		}
+	}
+}

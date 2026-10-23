@@ -1,0 +1,24 @@
+# Редакторы и ОС
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Логи и временные файлы
+*.log
+*.tmp
+tmp/
+
+# Локальные артефакты разработки
+proto/*.local.*
+*.key
+*.bak
+
+# Node
+node_modules/
+
+# Локальные рабочие каталоги
+.scratch/
+.session-history/
+.superpowers/
+.tmp/

@@ -1,0 +1,359 @@
+#!/bin/sh
+# singbounds rpcd-плагин — ubus-объект "singbounds".
+# Контракт rpcd (OpenWrt 25.12): `singbounds list` печатает JSON-объект
+# с объявлением методов; `singbounds call <method>` читает JSON-аргументы
+# со STDIN, печатает JSON-ответ на stdout; exit 1 + stderr превращается
+# rpcd в ubus-ошибку с текстом stderr.
+# Бизнес-логика — в /usr/lib/sing-bounds/backend.sh (sb_backend_*).
+
+. /usr/share/libubox/jshn.sh
+# backend.sh сам source-ит firewall.sh (sb_fw_* нужны только backend-у).
+. /usr/lib/sing-bounds/backend.sh
+
+sb_usage() {
+	echo "rpcd-плагин singbounds: вызывается rpcd, не человеком" >&2
+	exit 1
+}
+
+sb_decl() {
+	json_init
+	json_add_object "status"; json_close_object
+	json_add_object "list"; json_close_object
+	json_add_object "add_inbound"
+	json_add_string "name" "string"
+	json_add_string "port" "integer"
+	json_add_string "sni" "string"
+	json_add_string "vip" "string"
+	json_close_object
+	json_add_object "del_inbound"
+	json_add_string "id" "string"
+	json_close_object
+	# вкл/выкл без удаления, редактирование, проверка WAN.
+	json_add_object "toggle_inbound"
+	json_add_string "id" "string"
+	json_add_string "enabled" "string"
+	json_close_object
+	json_add_object "toggle_client"
+	json_add_string "id" "string"
+	json_add_string "enabled" "string"
+	json_close_object
+	json_add_object "edit_inbound"
+	json_add_string "id" "string"
+	json_add_string "name" "string"
+	json_add_string "port" "integer"
+	json_add_string "sni" "string"
+	json_close_object
+	json_add_object "check_wan"; json_close_object
+	# рестарт сервиса для таба «Система» (убран ubus-объект
+	# rc из ACL-пути: стандартный путь LuCI недоступен — свой метод).
+	json_add_object "restart"; json_close_object
+	json_add_object "add_client"
+	json_add_string "inbound" "string"
+	json_add_string "name" "string"
+	json_close_object
+	json_add_object "del_client"
+	json_add_string "inbound" "string"
+	json_add_string "id" "string"
+	json_close_object
+	json_add_object "get_links"
+	json_add_string "inbound" "string"
+	json_close_object
+	json_add_object "tsc_status"; json_close_object
+	json_add_object "tsc_install_info"; json_close_object
+	json_add_object "tsc_install"
+	json_add_string "where" "string"
+	json_close_object
+	json_add_object "tsc_server"
+	json_add_string "server" "string"
+	json_add_string "authkey" "string"
+	json_add_string "routes" "string"
+	json_close_object
+	json_add_object "tsc_login"; json_close_object
+	json_add_object "tsc_logout"; json_close_object
+	json_add_object "tsc_remove"; json_close_object
+	json_add_object "uninstall"; json_close_object
+	json_dump
+}
+
+sb_args() {
+	json_load "$(cat)"
+}
+
+# sb_running: 0 — наш sing-box-процесс с /etc/sing-bounds/config.json жив.
+# Детект через pgrep -f по точной командной строке (`ps w | grep`
+# дублировал backend и был платформенно-зависим от обрезки ps-вывода).
+sb_running() {
+	pgrep -f 'sing-box run -c /etc/sing-bounds/config.json' >/dev/null 2>&1
+}
+
+# sb_call_status: делегирует sb_backend_status из backend.sh (единый
+# источник: pgrep-детект + sing-box version + счёт инбаундов), переводит
+# TAB-протокол в JSON.
+# Важные детали jshn/версий:
+#   1) `json_add_boolean "running" true` — jshn принимает только 0/1,
+#      строка 'true' выходит как false (тот же урок — в del_inbound);
+#   2) version берётся из фактического `sing-box version`, а не
+#      хардкодом.
+sb_call_status() {
+	local out run ver n nport nvip
+	out="$(sb_backend_status)" || exit 1
+	run="$(printf '%s' "$out" | cut -f1)"
+	ver="$(printf '%s' "$out" | cut -f2)"
+	n="$(printf '%s' "$out" | cut -f3)"
+	nport="$(printf '%s' "$out" | cut -f4)"
+	nvip="$(printf '%s' "$out" | cut -f5)"
+	[ "$run" = "true" ] && run=1 || run=0
+	case "$n" in
+		''|*[!0-9]*) n=0 ;;
+	esac
+	# next_port/next_vip — подсказки для автозаполнения модалки
+	# создания (пустой расчёт = 0 — фронт показывает пустое поле).
+	case "$nport" in
+		''|*[!0-9]*) nport=0 ;;
+	esac
+	json_init
+	json_add_boolean "running" $run
+	json_add_string "version" "${ver:-unknown}"
+	json_add_int "inbounds" "$n"
+	json_add_int "next_port" "$nport"
+	json_add_string "next_vip" "${nvip:-}"
+	json_dump
+}
+
+sb_call_list() {
+	# КОНТРАКТ rpcd/ubus: ответ метода обязан быть JSON-ОБЪЕКТОМ —
+	# top-level массив `[...]` rpcd отклоняет («Invalid argument» на
+	# ubus call). Поэтому backend печатает объект {"inbounds": [...]},
+	# плагин транслирует его как есть.
+	sb_backend_list
+}
+
+sb_call_add_inbound() {
+	sb_args
+	json_get_var t_name name
+	json_get_var t_port port
+	json_get_var t_sni sni
+	json_get_var t_vip vip
+	[ -n "$t_name" ] || { echo "имя инбаунда не задано" >&2; exit 1; }
+	# port/sni/vip опциональны: пусто = авто-подбор в backend.
+	local out id port vip
+	out="$(sb_backend_add_inbound "$t_name" "$t_port" "$t_sni" "$t_vip")" || exit 1
+	id="${out%%	*}"
+	port="${out#*	}"; port="${port%%	*}"
+	vip="${out##*	}"
+	json_init
+	json_add_string "id" "$id"
+	json_add_int "port" "$port"
+	json_add_string "vip" "$vip"
+	json_dump
+}
+
+# toggle/edit/check_wan — обёртки над backend-методами.
+# enabled приходит строкой '0'/'1' (json_get_var), backend сам валидирует.
+sb_call_toggle_inbound() {
+	sb_args
+	json_get_var t_id id
+	json_get_var t_enabled enabled
+	[ -n "$t_id" ] || { echo "id инбаунда не задан" >&2; exit 1; }
+	[ -n "$t_enabled" ] || { echo "enabled не задан" >&2; exit 1; }
+	# вывод backend (toggled\t…) НЕ должен попадать в stdout rpcd —
+	# он приклеивается к JSON-ответу и ubus бракует его («Invalid
+	# argument»); заворачиваем в $(…).
+	local out
+	out="$(sb_backend_toggle_inbound "$t_id" "$t_enabled")" || exit 1
+	json_init
+	json_add_boolean "toggled" 1
+	json_dump
+}
+
+sb_call_toggle_client() {
+	sb_args
+	json_get_var t_id id
+	json_get_var t_enabled enabled
+	[ -n "$t_id" ] || { echo "id клиента не задан" >&2; exit 1; }
+	[ -n "$t_enabled" ] || { echo "enabled не задан" >&2; exit 1; }
+	local out
+	out="$(sb_backend_toggle_client "$t_id" "$t_enabled")" || exit 1
+	json_init
+	json_add_boolean "toggled" 1
+	json_dump
+}
+
+sb_call_edit_inbound() {
+	sb_args
+	json_get_var t_id id
+	json_get_var t_name name
+	json_get_var t_port port
+	json_get_var t_sni sni
+	[ -n "$t_id" ] || { echo "id инбаунда не задан" >&2; exit 1; }
+	local out
+	out="$(sb_backend_edit_inbound "$t_id" "$t_name" "$t_port" "$t_sni")" || exit 1
+	json_init
+	json_add_boolean "edited" 1
+	json_dump
+}
+
+sb_call_check_wan() {
+	# без аргументов; выход — ip TAB ms из backend.
+	local out ip ms
+	out="$(sb_backend_check_wan)" || exit 1
+	ip="${out%%	*}"
+	ms="${out##*	}"
+	case "$ms" in
+		''|*[!0-9]*) ms=0 ;;
+	esac
+	json_init
+	json_add_string "ip" "$ip"
+	json_add_int "ms" "$ms"
+	json_dump
+}
+
+sb_call_del_inbound() {
+	sb_args
+	json_get_var t_id id
+	[ -n "$t_id" ] || { echo "id инбаунда не задан" >&2; exit 1; }
+	sb_backend_del_inbound "$t_id" >/dev/null || exit 1
+	# jshn: json_add_boolean принимает 0/1, строка 'true' даёт false.
+	json_init
+	json_add_boolean "deleted" 1
+	json_dump
+}
+
+sb_call_add_client() {
+	sb_args
+	json_get_var t_inbound inbound
+	json_get_var t_name name
+	[ -n "$t_inbound" ] || { echo "инбаунд не задан" >&2; exit 1; }
+	[ -n "$t_name" ] || { echo "имя клиента не задано" >&2; exit 1; }
+	local out id uuid
+	out="$(sb_backend_add_client "$t_inbound" "$t_name")" || exit 1
+	id="${out%%	*}"
+	uuid="${out##*	}"
+	json_init
+	json_add_string "id" "$id"
+	json_add_string "uuid" "$uuid"
+	json_dump
+}
+
+sb_call_del_client() {
+	sb_args
+	json_get_var t_inbound inbound
+	json_get_var t_id id
+	[ -n "$t_inbound" ] || { echo "инбаунд не задан" >&2; exit 1; }
+	[ -n "$t_id" ] || { echo "id клиента не задан" >&2; exit 1; }
+	sb_backend_del_client "$t_inbound" "$t_id" >/dev/null || exit 1
+	# jshn: json_add_boolean принимает 0/1 (см. del_inbound).
+	json_init
+	json_add_boolean "deleted" 1
+	json_dump
+}
+
+sb_call_get_links() {
+	sb_args
+	json_get_var t_inbound inbound
+	[ -n "$t_inbound" ] || { echo "инбаунд не задан" >&2; exit 1; }
+	sb_backend_get_links "$t_inbound" || exit 1
+}
+
+sb_call_uninstall() {
+	sb_backend_uninstall || exit 1
+}
+
+# рестарт сервиса (/etc/init.d/singbounds restart из backend). Ответ
+# {restarted:true}; отказ — exit 1 + stderr (бэкенд проверил, что
+# sing-box-процесс поднялся после рестарта).
+sb_call_restart() {
+	local out
+	out="$(sb_backend_restart)" || exit 1
+	json_init
+	json_add_boolean "restarted" 1
+	json_dump
+}
+
+# --- Tailscale (v1.3) ----------------------------------------------------
+# sb_tsc_* из backend.sh уже печатают готовый JSON — плагин только
+# транслирует (контракт: JSON-объект на stdout, отказ exit 1 + stderr).
+
+sb_call_tsc_status() {
+	sb_tsc_backend_status
+}
+
+sb_call_tsc_server() {
+	sb_args
+	json_get_var t_server server
+	json_get_var t_authkey authkey
+	json_get_var t_routes routes
+	sb_tsc_server_set "$t_server" "$t_authkey" "$t_routes" >/dev/null || exit 1
+	json_init
+	json_add_boolean "configured" 1
+	json_dump
+}
+
+# login: backend печатает {state} или {state,authurl} — pass-through
+# (фронт по authurl открывает браузерный вход).
+sb_call_tsc_login() {
+	sb_tsc_login
+}
+
+sb_call_tsc_logout() {
+	sb_tsc_logout >/dev/null || exit 1
+	json_init
+	json_add_boolean "logged_out" 1
+	json_dump
+}
+
+sb_call_tsc_remove() {
+	sb_tsc_remove >/dev/null || exit 1
+	json_init
+	json_add_boolean "removed" 1
+	json_dump
+}
+
+# install_info: готовность к установке (место на флеше, USB-точки).
+sb_call_tsc_install_info() {
+	sb_tsc_backend_install_info
+}
+
+# install: where = "overlay" | "usb:<mnt>". Установка — минуты:
+# rpcd-таймаут ubus по умолчанию 30 с; фронт вызывает с async-скрытым
+# спиннером и не разрывает соединение.
+sb_call_tsc_install() {
+	local where
+	sb_args
+	json_get_var t_where where
+	[ -n "$t_where" ] || { echo "место установки не задано" >&2; exit 1; }
+	sb_tsc_install_on "$t_where" || exit 1
+	json_init
+	json_add_boolean "installed" 1
+	json_dump
+}
+
+case "${1:-}" in
+	list) sb_decl ;;
+	call)
+		case "${2:-}" in
+			status) sb_call_status ;;
+			list) sb_call_list ;;
+			add_inbound) sb_call_add_inbound ;;
+			del_inbound) sb_call_del_inbound ;;
+			toggle_inbound) sb_call_toggle_inbound ;;
+			toggle_client) sb_call_toggle_client ;;
+			edit_inbound) sb_call_edit_inbound ;;
+			check_wan) sb_call_check_wan ;;
+			restart) sb_call_restart ;;
+			add_client) sb_call_add_client ;;
+			del_client) sb_call_del_client ;;
+			get_links) sb_call_get_links ;;
+			tsc_status) sb_call_tsc_status ;;
+			tsc_install_info) sb_call_tsc_install_info ;;
+			tsc_install) sb_call_tsc_install ;;
+			tsc_server) sb_call_tsc_server ;;
+			tsc_login) sb_call_tsc_login ;;
+			tsc_logout) sb_call_tsc_logout ;;
+			tsc_remove) sb_call_tsc_remove ;;
+			uninstall) sb_call_uninstall ;;
+			*) echo "неизвестный метод: ${2:-}" >&2; exit 1 ;;
+		esac
+		;;
+	*) sb_usage ;;
+esac

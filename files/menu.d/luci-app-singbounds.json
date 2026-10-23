@@ -1,0 +1,10 @@
+{
+	"admin/services/singbounds": {
+		"title": "sing-bounds",
+		"order": 90,
+		"action": {
+			"type": "view",
+			"path": "singbounds/app"
+		}
+	}
+}

@@ -1,0 +1,36 @@
+#!/bin/sh
+# singbounds-ctl — CLI-обёртка sing-bounds.
+#
+# Установка: files/backend/singbounds-ctl
+# -> /usr/bin/singbounds-ctl (chmod 755). Позиционные аргументы посылаются
+# в ucode, а shell-обёртка нужна, чтобы:
+#   1) rc-скрипт и человек вызывали одну и ту же команду (а не длинный
+#      `ucode /usr/lib/sing-bounds/render.uc`);
+#   2) новые подкоманды (validate, dump и пр.) добавлялись
+#      тут, не трогая init-скрипт.
+#
+# Подкоманды:
+#   render   — вывести сгенерированный sing-box JSON (канонический %J-вид
+#              netbounds.renderConfig) на stdout. Exit-коды наследуются
+#              от render.uc: 0 — ок; 1 — пустое состояние; 2 — ошибка рендера.
+#
+# POSIX sh; run-parts-style отказ от многобуквенных опций getopt.
+
+RENDER_UC="${SINGBOUNDS_RENDER_UC:-/usr/lib/sing-bounds/render.uc}"
+UCODE_BIN="${UCODE_BIN:-ucode}"
+
+case "${1:-}" in
+	render)
+		shift
+		exec "$UCODE_BIN" "$RENDER_UC" "$@"
+		;;
+	'')
+		echo "Usage: singbounds-ctl render" >&2
+		exit 2
+		;;
+	*)
+		echo "singbounds-ctl: unknown command: $1" >&2
+		echo "Usage: singbounds-ctl render" >&2
+		exit 2
+		;;
+esac

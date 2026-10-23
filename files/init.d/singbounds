@@ -1,0 +1,159 @@
+#!/bin/sh /etc/rc.common
+# singbounds — procd-сервис sing-box для sing-bounds.
+#
+# Поведение (кратко):
+#   restart:
+#     1) /usr/bin/singbounds-ctl render > /etc/sing-bounds/config.json.tmp
+#     2) sing-box check -c config.json.tmp
+#     3) провал  -> tmp удалён, ошибка в logger + procd, работающий
+#                  экземпляр НЕ трогаем, exit != 0 — старый config.json
+#                  и процесс живут как есть (rollback при битом конфиге);
+#     4) успех   -> атомарный mv поверх config.json, stop + start.
+#   start:
+#     та же генерация+check; при провале — exit 1 ДО создания инстанса —
+#     procd не запускает мёртвый сервис (см. известное ограничение ниже).
+#
+# Почему restart не «дефолтный»: rc.common restart = stop + start, и если
+# новый рендер невалиден, сервис уже остановлен — «старый конфиг продолжает
+# работать» не выполняется. Поэтому restart() переопределён: сначала
+# ГЕНЕРАЦИЯ+CHECK, и только при успехе stop + старт нового. При провале
+# работающий экземпляр не трогаем вовсе.
+#
+# ИЗВЕСТНОЕ ОГРАНИЧЕНИЕ (start-путь): rc.common вызывает start() -> rc_procd
+# -> start_service, и procd_close_service отправляет set-команду В ЛЮБОМ
+# случае (даже если start_service вернул 1). Если инстансов не открыто,
+# procd интерпретирует это как «пустой сервис» и ОСТАНАВЛИВАЕТ работающий
+# инстанс. Гарантия отката, таким образом, держится на restart
+# (проверяемый путь); для start при битом конфиге start_service
+# НЕ открывает инстанс, логирует и возвращает 1 — сервис не стартует,
+# но уже работающий инстанс при голом `start` будет остановлен procd-ом
+# (задокументированное ограничение).
+#
+# USE_PROCD=1: procd управляет respawn и жизнью процесса. stop_service()
+# дефолтен (procd убивает инстанс), но оставлен явным для читаемости и
+# точки расширения firewall (fw_rule-хуки при stop).
+#
+# status: НЕ переопределяем status() — rc.common с USE_PROCD сам
+# регистрирует команду status и вызывает status_service(), если она
+# определена (проверено по rc.common openwrt-24.10).
+
+USE_PROCD=1
+START=99
+STOP=10
+
+# Пути фиксированы: локальный сухой прогон tests/init-dryrun.sh подменяет
+# их sed-ом по КОПИИ скрипта.
+
+SINGBOUNDS_DIR=/etc/sing-bounds
+CONFIG_FILE=$SINGBOUNDS_DIR/config.json
+TMP_FILE=$SINGBOUNDS_DIR/config.json.tmp
+SINGBOUNDS_CTL=/usr/bin/singbounds-ctl
+SINGBOX_BIN=/usr/bin/sing-box
+
+sb_log() {
+	# $@ — сообщение; дублируем в syslog (logger есть на любом OpenWrt)
+	# и в stderr procd (rc.common подмешает вывод в результат команды).
+	local msg="singbounds: $*"
+	logger -t singbounds -s "$msg"
+}
+
+# Генерация + проверка конфига. Выход: 0 — config.json готов и валиден
+# (свеже-записан), 1 — провал (tmp удалён, старый config.json не тронут).
+# stdout/stderr check-а транслируется в лог.
+sb_generate_and_check() {
+	mkdir -p "$SINGBOUNDS_DIR" || {
+		sb_log "не могу создать $SINGBOUNDS_DIR"
+		return 1
+	}
+
+	if ! "$SINGBOUNDS_CTL" render > "$TMP_FILE"; then
+		rm -f "$TMP_FILE"
+		sb_log "render провалился (UCI пуст или ошибка рендера); старый конфиг сохранён"
+		return 1
+	fi
+
+	# Отдельный файл под вывод check, чтобы диагностика попала в лог
+	# целиком, а не только первая строка.
+	local check_err
+	if ! check_err=$("$SINGBOX_BIN" check -c "$TMP_FILE" 2>&1); then
+		rm -f "$TMP_FILE"
+		sb_log "sing-box check провалился; старый конфиг сохранён: $check_err"
+		return 1
+	fi
+
+	# Атомарная замена в том же каталоге (та же ФС): mv rename(2).
+	mv -f "$TMP_FILE" "$CONFIG_FILE" || {
+		rm -f "$TMP_FILE"
+		sb_log "не могу записать $CONFIG_FILE (mv провалился)"
+		return 1
+	}
+
+	return 0
+}
+
+start_service() {
+	# Генерация+check ДО procd_open_instance: при провале выходим с
+	# ненулевым кодом ДО создания инстанса — procd не поднимает мёртвый
+	# сервис. Если экземпляр УЖЕ работает (перезапуск поверх живого),
+	# сначала убеждаемся, что новый конфиг валиден, и только тогда
+	# позволяем rc_procd переописать сервис: rc.common отправляет
+	# procd_close_service даже при провале start_service, а «пустой»
+	# набор инстансов заставил бы procd остановить работающий.
+	# (Для честного stop-старта на битом конфиге — известное ограничение
+	# start-пути, см. комментарий в шапке; restart — отклоняется
+	# целиком, экземпляр не трогаем.)
+	sb_generate_and_check || {
+		sb_log "start отклонён: конфиг не прошёл проверку, инстанс не создаётся"
+		return 1
+	}
+
+	procd_open_instance singbounds
+	procd_set_param command "$SINGBOX_BIN" run -c "$CONFIG_FILE"
+	# respawn: procd поднимает упавший процесс; thresholds как у
+	# стандартных сетевых сервисов OpenWrt.
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param file "$CONFIG_FILE"   # рестарт при смене конфига
+	procd_close_instance
+}
+
+stop_service() {
+	# Дефолтное поведение procd достаточно (убивает инстанс). Явно
+	# оставлено как точка расширения (снятие fw_rule).
+	service_stop "$SINGBOX_BIN"
+}
+
+restart() {
+	# Сначала проверяем новый конфиг; при провале работающий экземпляр
+	# НЕ останавливается (rollback-семантика). При успехе —
+	# штатный stop+start (в rc.common они доступны как функции, а не
+	# рекурсия в сам скрипт).
+	sb_generate_and_check || {
+		sb_log "restart отклонён: новый конфиг не прошёл проверку, работающий сервис не тронут"
+		return 1
+	}
+
+	stop
+	start
+}
+
+# status_service(): вызывается rc.common-командой `status` (USE_PROCD
+# автоматически регистрирует её и диспетчеризует сюда, если функция
+# определена; собственный status() был бы мёртвым кодом на реальном
+# rc.common — USE_PROCD-блок переопределяет его).
+# pid жив? (procd делает respawn, поэтому «нет pid» == «не запущен»)
+status_service() {
+	local pid
+	pid=$(pgrep -f "sing-box run -c $CONFIG_FILE" | head -n 1)
+	if [ -n "$pid" ]; then
+		echo "singbounds: работающий sing-box (PID $pid, конфиг $CONFIG_FILE)"
+		return 0
+	fi
+	if [ -f "$CONFIG_FILE" ]; then
+		echo "singbounds: процесс не запущен; конфиг $CONFIG_FILE существует"
+	else
+		echo "singbounds: процесс не запущен; конфиг $CONFIG_FILE отсутствует"
+	fi
+	return 3
+}
